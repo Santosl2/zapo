@@ -1,6 +1,5 @@
 import { createReadStream } from 'node:fs'
 
-import { delay } from 'zapo-js'
 
 import {
     assertMediaUploadStatus,
@@ -27,6 +26,7 @@ import type {
     WaLinkPreviewThumbnailStream
 } from '@message/addons/link-preview/types'
 import { proto } from '@proto'
+import { delay } from '@util/async'
 import type { ServerClock } from '@util/clock'
 import { toError } from '@util/primitives'
 

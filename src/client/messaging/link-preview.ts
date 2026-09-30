@@ -25,6 +25,7 @@ import type {
     WaLinkPreviewThumbnailStream
 } from '@message/addons/link-preview/types'
 import { proto } from '@proto'
+import { delay } from '@util/async'
 import type { ServerClock } from '@util/clock'
 import { toError } from '@util/primitives'
 
@@ -141,7 +142,7 @@ async function resolveBytesThumbnailFields(
                 delayMs: Math.round(delayMs),
                 message: toError(error).message
             })
-            await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+            await delay(delayMs)
         }
     }
     return inlineFields

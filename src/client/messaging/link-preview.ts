@@ -1,5 +1,7 @@
 import { createReadStream } from 'node:fs'
 
+import { delay } from 'zapo-js'
+
 import {
     assertMediaUploadStatus,
     buildMediaUploadUrl,
@@ -29,6 +31,8 @@ import type { ServerClock } from '@util/clock'
 import { toError } from '@util/primitives'
 
 const INLINE_THUMBNAIL_MAX_BYTES = 64 * 1024
+const THUMBNAIL_UPLOAD_MAX_ATTEMPTS = 3
+const THUMBNAIL_UPLOAD_BASE_DELAY_MS = 250
 
 /**
  * Where the preview is published. `chat` uploads the HQ thumbnail encrypted;
@@ -115,15 +119,33 @@ async function resolveBytesThumbnailFields(
     if (deps.options.uploadHqThumbnail === false) {
         return inlineFields
     }
-    try {
-        const hqFields = await uploadHqFromBytes(deps, thumbnail)
-        return { ...inlineFields, ...hqFields }
-    } catch (error) {
-        deps.logger.warn('link preview thumbnail upload failed', {
-            message: toError(error).message
-        })
-        return inlineFields
+
+    for (let attempt = 1; attempt <= THUMBNAIL_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+        try {
+            const hqFields = await uploadHqFromBytes(deps, thumbnail)
+            return { ...inlineFields, ...hqFields }
+        } catch (error) {
+            const isLastAttempt = attempt === THUMBNAIL_UPLOAD_MAX_ATTEMPTS
+            if (isLastAttempt) {
+                deps.logger.warn('link preview thumbnail upload failed', {
+                    attempt,
+                    maxAttempts: THUMBNAIL_UPLOAD_MAX_ATTEMPTS,
+                    message: toError(error).message
+                })
+                break
+            }
+            const delayMs =
+                THUMBNAIL_UPLOAD_BASE_DELAY_MS * 2 ** (attempt - 1) * (0.5 + Math.random())
+            deps.logger.warn('link preview thumbnail upload failed, retrying', {
+                attempt,
+                maxAttempts: THUMBNAIL_UPLOAD_MAX_ATTEMPTS,
+                delayMs: Math.round(delayMs),
+                message: toError(error).message
+            })
+            await delay(delayMs)
+        }
     }
+    return inlineFields
 }
 
 async function resolveStreamThumbnailFields(

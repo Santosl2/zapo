@@ -1,7 +1,10 @@
 import type { WaClientPluginContext } from 'zapo-js'
 import type { BinaryNode } from 'zapo-js/transport'
 
+import type { WaCallMediaMessage, WaCallReaction } from '@zapo-js/voip-media'
+
 import type { CallInfo } from './call/call-state.js'
+import type { PeerScreenShare } from './signaling/screen-share.js'
 
 export type WaVoipDeps = WaClientPluginContext['deps']
 
@@ -37,7 +40,11 @@ export enum EndCallReason {
     /** The call had a media path and lost it, with no leg left to carry it. */
     RelayLost = 'relay_lost',
     DoNotDisturb = 'do_not_disturb',
-    Unknown = 'unknown'
+    Unknown = 'unknown',
+    /** Another device of this account answered the incoming call. */
+    AcceptedElsewhere = 'accepted_elsewhere',
+    /** Another device of this account declined the incoming call. */
+    RejectedElsewhere = 'rejected_elsewhere'
 }
 
 export type CallTransition =
@@ -53,23 +60,8 @@ export type CallTransition =
     | { type: 'resume' }
     | { type: 'audio_mute_changed'; muted: boolean }
     | { type: 'video_state_changed'; off: boolean }
-
-export interface SrtpKeyingMaterial {
-    masterKey: Uint8Array
-    masterSalt: Uint8Array
-}
-
-export enum PayloadType {
-    WhatsAppOpus = 120,
-    WhatsAppH264 = 97,
-    /**
-     * Lowest payload type of WhatsApp's proprietary Reed-Solomon video FEC
-     * family, which the client emits as `103 + 3k`. Not an RTX stream: the
-     * payload is opaque parity, with no prefix and no original sequence number,
-     * and it travels on the FEC stream's own SSRC.
-     */
-    WhatsAppVideoFec = 103
-}
+    | { type: 'hand_raise_changed'; raised: boolean }
+    | { type: 'screen_share_changed'; sharing: boolean }
 
 export interface InboundVideoRtpPacket {
     readonly payloadType: number
@@ -83,6 +75,13 @@ export interface InboundVideoRtpPacket {
 
 export interface InboundVideoFrame {
     readonly codec: 'h264'
+    /**
+     * SSRC of the stream this frame was assembled from, so frames of two senders never
+     * mix. It does **not** separate a peer's camera from its screen: a share derives the
+     * same SSRCs its camera does, and {@link CallInfo.peerScreenShare} is what says the
+     * peer is sharing.
+     */
+    readonly ssrc: number
     readonly timestamp: number
     readonly keyFrame: boolean
     /** Complete Annex-B access unit. */
@@ -180,6 +179,33 @@ export interface CallSession {
     isInitiator: boolean
 }
 
+/**
+ * Video state the peer announced mid-call. `state` is the raw wire number, the ordinal of
+ * `WA_VIDEO_STATE` with no translation, kept raw so a code this package does not model
+ * yet still reaches the consumer.
+ */
+export interface PeerVideoStateChange {
+    /** `state`, one of `WA_VIDEO_STATE`. */
+    readonly state: number
+    /** Raw `transaction-id`, the sender's own counter from 1. `null` when absent. */
+    readonly transactionId: number | null
+    /** Raw `device_orientation` attribute, or `null` when absent. */
+    readonly deviceOrientation: number | null
+    /** Codecs the peer can decode, from `dec`. `null` when the message omitted it. */
+    readonly decoderCodec: string | null
+    /**
+     * The codec the peer's encoder produces, from `enc` - not {@link decoderCodec}: one
+     * says what the peer sends, the other what it receives.
+     */
+    readonly encoderCodec: string | null
+    /**
+     * `enc_supported`, the peer's decode capability as a bitmask over the codecs
+     * {@link decoderCodec} names in text. Only sent when non-zero, so `null` means the
+     * peer left it off, not that it supports nothing.
+     */
+    readonly supportedCodecs: number | null
+}
+
 export interface NodeInfo {
     tag: string
     peerJid: string
@@ -212,40 +238,48 @@ export interface CallManagerEvents {
     call_state: (call: CallInfo) => void
     call_incoming: (call: CallInfo) => void
     call_ended: (call: CallInfo) => void
-    /**
-     * Decoded peer audio for this call (16 kHz mono PCM), paced by the jitter
-     * buffer: one tick of `playbackOutputSize` samples every `intervalMs`, so
-     * the stream keeps the call's timebase and a gap the decoder could not
-     * conceal arrives as silence instead of vanishing. A tick with nothing
-     * queued at all is skipped rather than emitted as silence.
-     */
+    /** See `voip_call_peer_mute`. */
+    call_peer_mute: (call: CallInfo, muted: boolean) => void
+    /** See `voip_call_inbound_audio`. */
     call_inbound_audio: (call: CallInfo, pcm: Float32Array) => void
     call_inbound_video_rtp: (call: CallInfo, packet: InboundVideoRtpPacket) => void
     call_inbound_video: (call: CallInfo, frame: InboundVideoFrame) => void
+    /** The peer reported a screen-share state change on this call. */
+    call_screen_share: (call: CallInfo, share: PeerScreenShare) => void
+    /** See `voip_call_peer_video_state`. */
+    call_peer_video_state: (call: CallInfo, change: PeerVideoStateChange) => void
     /** Preloaded outbound audio finished sending on this call. */
     call_outbound_audio_finished: (call: CallInfo) => void
+    /** See `voip_call_hand_raise`. */
+    call_hand_raise: (call: CallInfo, participantJid: string, raised: boolean) => void
+    /** See `voip_call_reaction`. */
+    call_reaction: (call: CallInfo, reaction: WaCallReaction) => void
+    /** See `voip_call_media`. */
+    call_media: (call: CallInfo, message: WaCallMediaMessage) => void
     call_error: (error: Error) => void
 }
 
 export interface AudioSender {
-    sendCapturedAudio(data: Float32Array): void
+    /**
+     * Takes one captured chunk, its first sample captured at `capturedAtMs` (`performance.now()`).
+     * `data` is the engine's reused buffer: consume or copy it before returning.
+     */
+    sendCapturedAudio(data: Float32Array, capturedAtMs?: number): void
 }
 
 export interface WaAudioEngineConfig {
     sampleRate: number
-    /** Samples read from the outbound source on every capture tick. */
+    /** Samples per chunk read from the outbound source; a tick moves as many as time owes. */
     captureChunkSize: number
     /**
-     * Samples drained from the jitter buffer on every playback tick. Keep it at
-     * `sampleRate / 1000 * intervalMs` so playout advances at wall-clock speed:
-     * the engine raises it to one tick's worth when it is set lower.
+     * Samples per block pulled from the playout source, as many blocks per tick as time owes.
+     * Raised to one tick's worth (`sampleRate / 1000 * intervalMs`) when set lower.
      */
     playbackOutputSize: number
     /**
-     * Jitter buffer capacity in samples. Never smaller than one inbound packet,
-     * which is 120 ms carrying two aggregated MLow frames.
+     * How often both clocks check what they owe. The audio is paced by
+     * elapsed time, not by how many ticks fired.
      */
-    maxBufferSize: number
     intervalMs: number
 }
 
@@ -253,20 +287,8 @@ export const DEFAULT_AUDIO_CONFIG: WaAudioEngineConfig = {
     sampleRate: 16000,
     captureChunkSize: 960,
     playbackOutputSize: 960,
-    maxBufferSize: 11520,
     intervalMs: 60
 }
-
-export const SRTP_SEND_AUTH_TAG_LEN = 4
-export const SRTP_RECV_AUTH_TAG_LEN = 4
-
-export const SRTP_AUTH_TAG_LEN = 4
-
-export const SRTP_LABEL = {
-    ENCRYPTION: 0x00,
-    AUTH: 0x01,
-    SALT: 0x02
-} as const
 
 export const WA_RELAY_PORT = 3480
 

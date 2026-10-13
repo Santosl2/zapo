@@ -576,7 +576,10 @@ function inbound(
     return { codec: 'h264', ssrc, timestamp, keyFrame, data: Uint8Array.from(bytes) }
 }
 
-function startReceiver(t: TestContext): {
+function startReceiver(
+    t: TestContext,
+    maxStreams?: number
+): {
     receiver: WaWebCallVideoReceiver
     pictures: { picture: FakeVideoFrame; ssrc: number }[]
     errors: { error: unknown; ssrc: number }[]
@@ -588,7 +591,8 @@ function startReceiver(t: TestContext): {
         onFrame: (picture, ssrc) => {
             pictures.push({ picture: picture as unknown as FakeVideoFrame, ssrc })
         },
-        onError: (error, ssrc) => errors.push({ error, ssrc })
+        onError: (error, ssrc) => errors.push({ error, ssrc }),
+        maxStreams
     })
     t.after(() => receiver.close())
     return { receiver, pictures, errors }
@@ -738,6 +742,34 @@ test('each SSRC gets its own decoder, at most four, the oldest closed for a fift
     for (const ssrc of [1, 2, 3, 4, 5]) receiver.push(inbound(ssrc, 0, true))
 
     assert.equal(FakeVideoDecoder.all.length, 5)
+    assert.deepEqual(
+        FakeVideoDecoder.all.map((decoder) => decoder.state),
+        ['closed', 'configured', 'configured', 'configured', 'configured']
+    )
+})
+
+test('a group call raises the decoders held at once with maxStreams', (t) => {
+    const { receiver } = startReceiver(t, 6)
+    for (const ssrc of [1, 2, 3, 4, 5, 6, 7]) receiver.push(inbound(ssrc, 0, true))
+
+    assert.deepEqual(
+        FakeVideoDecoder.all.map((decoder) => decoder.state),
+        [
+            'closed',
+            'configured',
+            'configured',
+            'configured',
+            'configured',
+            'configured',
+            'configured'
+        ]
+    )
+})
+
+test('a maxStreams that is not a number keeps the default of four', (t) => {
+    const { receiver } = startReceiver(t, Number.NaN)
+    for (const ssrc of [1, 2, 3, 4, 5]) receiver.push(inbound(ssrc, 0, true))
+
     assert.deepEqual(
         FakeVideoDecoder.all.map((decoder) => decoder.state),
         ['closed', 'configured', 'configured', 'configured', 'configured']

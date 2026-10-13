@@ -4,6 +4,7 @@ import type { BinaryNode } from 'zapo-js/transport'
 import type { WaCallMediaMessage, WaCallReaction } from '@zapo-js/voip-media'
 
 import type { CallInfo } from './call/call-state.js'
+import type { WaGroupCompositionDiff } from './call/group-participants.js'
 import type { PeerScreenShare } from './signaling/screen-share.js'
 
 export type WaVoipDeps = WaClientPluginContext['deps']
@@ -39,6 +40,13 @@ export enum EndCallReason {
     Failed = 'failed',
     /** The call had a media path and lost it, with no leg left to carry it. */
     RelayLost = 'relay_lost',
+    /** The server refused our offer; the peers were told `setup_failed`. */
+    SetupFailed = 'setup_failed',
+    /**
+     * The server took this side off a group call that goes on, because the others stopped
+     * receiving its media (`user_invisible`). It can be joined again with `joinCall`.
+     */
+    Invisible = 'invisible',
     DoNotDisturb = 'do_not_disturb',
     Unknown = 'unknown',
     /** Another device of this account answered the incoming call. */
@@ -109,6 +117,8 @@ export interface RelayInfo {
 export interface RelayEndpoint {
     ip: string
     port: number
+    /** `token_id` of the endpoint: which `<token>` of its own descriptor {@link token} is. */
+    tokenId?: string
     token: string
     authToken?: string
     rawAuthToken?: Uint8Array
@@ -150,6 +160,12 @@ export interface RelayData {
      * and decoded to audio, both through the live session and through a twin
      * built from the same keys, with no `auth_failed`. So the relay adds no
      * hop-by-hop layer of its own, and none is owed here.
+     *
+     * Nor on a group call's uplink, measured A/B with two runs per arm: wrapped
+     * in the hop-by-hop layer, the other participants counted 0 of our packets
+     * and dropped us to `invited`; unwrapped, they counted 1916 and 3818 and kept
+     * us connected. SRTP leaves the RTP header in the clear, so the SFU routes
+     * without it. Do not apply it on send.
      */
     hbhKey?: Uint8Array
 }
@@ -217,10 +233,16 @@ export interface NodeInfo {
     innerNode: BinaryNode
 }
 
-/** Options for placing an outgoing call via `client.voip.startCall`. */
-export interface CallOfferOptions {
-    /** Bare or device JID to call. */
-    peerJid: string
+/** One participant of an outgoing group call. */
+export interface CallOfferParticipant {
+    /** The account to ring, a LID. */
+    readonly jid: string
+    /** Its device JIDs, at most five; omit to resolve them, falling back to the primary. */
+    readonly devices?: readonly string[]
+}
+
+/** What a 1:1 and a group call offer share. */
+interface CallOfferCommonOptions {
     /**
      * Flag the call as a video call (default `false`). When set, H.264 video
      * media flows alongside audio: send access units with
@@ -230,30 +252,78 @@ export interface CallOfferOptions {
     isVideo?: boolean
     /** Audio file to preload and play once the call connects (needs ffmpeg). */
     audioFile?: string
-    /** Explicit peer device JIDs to ring; omit to resolve them automatically. */
-    peerDevices?: string[]
 }
 
+/** A 1:1 call to {@link peerJid}. */
+export interface OneToOneCallOfferOptions extends CallOfferCommonOptions {
+    /** Bare or device JID to call. */
+    peerJid: string
+    /** Explicit peer device JIDs to ring; omit to resolve them automatically. */
+    peerDevices?: string[]
+    groupJid?: never
+    participants?: never
+}
+
+/** A group call on {@link groupJid}, addressed to the call itself and ringing {@link participants}. */
+export interface GroupCallOfferOptions extends CallOfferCommonOptions {
+    /** The group (`...@g.us`) this call belongs to. */
+    groupJid: string
+    /** Who to ring, ourselves excluded. */
+    participants: readonly CallOfferParticipant[]
+    peerJid?: never
+    peerDevices?: never
+}
+
+/** Options for placing an outgoing call via `client.voip.startCall`: 1:1 or group, never both. */
+export type CallOfferOptions = OneToOneCallOfferOptions | GroupCallOfferOptions
+
+/** One sender's video asked of a group call's relay; see `client.voip.setVideoSubscriptions`. */
+export interface CallVideoSubscription {
+    /** The sender's device jid, as the events name it. */
+    readonly participantJid: string
+    /** One of `WA_VIDEO_QUALITY`; `Default` when omitted. */
+    readonly quality?: number
+}
+
+/** The trailing `participantJid` names the device it came from, when known. */
 export interface CallManagerEvents {
     call_state: (call: CallInfo) => void
     call_incoming: (call: CallInfo) => void
     call_ended: (call: CallInfo) => void
     /** See `voip_call_peer_mute`. */
-    call_peer_mute: (call: CallInfo, muted: boolean) => void
+    call_peer_mute: (call: CallInfo, muted: boolean, participantJid?: string) => void
     /** See `voip_call_inbound_audio`. */
     call_inbound_audio: (call: CallInfo, pcm: Float32Array) => void
-    call_inbound_video_rtp: (call: CallInfo, packet: InboundVideoRtpPacket) => void
-    call_inbound_video: (call: CallInfo, frame: InboundVideoFrame) => void
+    call_inbound_video_rtp: (
+        call: CallInfo,
+        packet: InboundVideoRtpPacket,
+        participantJid?: string
+    ) => void
+    call_inbound_video: (call: CallInfo, frame: InboundVideoFrame, participantJid?: string) => void
     /** The peer reported a screen-share state change on this call. */
-    call_screen_share: (call: CallInfo, share: PeerScreenShare) => void
+    call_screen_share: (call: CallInfo, share: PeerScreenShare, participantJid?: string) => void
     /** See `voip_call_peer_video_state`. */
-    call_peer_video_state: (call: CallInfo, change: PeerVideoStateChange) => void
+    call_peer_video_state: (
+        call: CallInfo,
+        change: PeerVideoStateChange,
+        participantJid?: string
+    ) => void
+    /** See `voip_call_participants_changed`. */
+    call_participants_changed: (call: CallInfo, diff: WaGroupCompositionDiff) => void
     /** Preloaded outbound audio finished sending on this call. */
     call_outbound_audio_finished: (call: CallInfo) => void
     /** See `voip_call_hand_raise`. */
     call_hand_raise: (call: CallInfo, participantJid: string, raised: boolean) => void
     /** See `voip_call_reaction`. */
-    call_reaction: (call: CallInfo, reaction: WaCallReaction) => void
+    call_reaction: (call: CallInfo, reaction: WaCallReaction, participantJid?: string) => void
+    /** See `voip_call_mute_requested`. */
+    call_mute_requested: (call: CallInfo, participantJid: string, requestState: string) => void
+    /** See `voip_call_participant_media`. */
+    call_participant_media: (call: CallInfo, participantJid: string, receiving: boolean) => void
+    /** See `voip_call_participant_audio`; only with `participantAudio` on. */
+    call_participant_audio: (call: CallInfo, participantJid: string, pcm: Float32Array) => void
+    /** See `voip_call_video_upgraded`. */
+    call_video_upgraded: (call: CallInfo, participantJid: string | null) => void
     /** See `voip_call_media`. */
     call_media: (call: CallInfo, message: WaCallMediaMessage) => void
     call_error: (error: Error) => void

@@ -10,6 +10,7 @@ export interface WaCallAudioSink {
     /**
      * Takes microphone samples, 16 kHz mono, at any length. `capturedAtMs` is the
      * `performance.now()` instant of `samples[0]`; absent, the block is taken as just captured.
+     * `samples` is only valid during the call: its buffer is reused for the playout.
      */
     pushCapture(samples: Float32Array, capturedAtMs?: number): void
     /** Fills `out` with speaker samples, 16 kHz mono, and returns how many were real audio. */
@@ -24,9 +25,15 @@ export interface WaWebCallAudioOptions {
     readonly microphone?: MediaStream
     /**
      * Context to run in. Default: a new 16 kHz `AudioContext`, or the device rate if refused.
-     * A context passed in is neither closed by `stop()` nor resumed.
+     * A context passed in is neither closed by `stop()`, resumed nor routed to an `output`.
      */
     readonly audioContext?: AudioContext
+    /**
+     * Output device id, from `enumerateDevices()`, for the context the adapter creates: passed as
+     * its constructor's `sinkId`, or to `setSinkId` where that is ignored (Chrome, Edge). Where
+     * neither applies, any but the default, `''`, fails `start`. Refused with `audioContext`.
+     */
+    readonly output?: string
     /**
      * URL of the worklet module; default a Blob URL. For a CSP that forbids `blob:`, serve
      * `WA_CALL_AUDIO_WORKLET_SOURCE` as a file and pass its URL.
@@ -54,6 +61,24 @@ const WORKLET_NODE_OPTIONS: AudioWorkletNodeOptions = {
     channelInterpretation: 'speakers'
 }
 
+/** Time constant of the mute ramp, in seconds: 99% of the way in 23 ms, too slow to click. */
+const PLAYOUT_MUTE_TIME_CONSTANT_S = 0.005
+
+const STOPPED_ERROR = 'the call audio has stopped'
+const CALLER_CONTEXT_OUTPUT_ERROR =
+    'an audioContext passed in keeps its own output: call its setSinkId instead'
+
+/** `sinkId` in the `AudioContext` constructor; Chrome and Edge read it, others ignore it. */
+interface CallAudioContextOptions extends AudioContextOptions {
+    readonly sinkId?: string
+}
+
+/** Output routing of an `AudioContext`: Chrome and Edge only, and not in TypeScript's DOM lib. */
+interface AudioOutputRouting {
+    readonly sinkId?: unknown
+    setSinkId?(sinkId: string): Promise<void>
+}
+
 interface WaWebCallAudioParts {
     readonly sink: WaCallAudioSink
     readonly context: AudioContext
@@ -62,6 +87,7 @@ interface WaWebCallAudioParts {
     readonly ownsMicrophone: boolean
     readonly source: MediaStreamAudioSourceNode
     readonly node: AudioWorkletNode
+    readonly gain: GainNode
 }
 
 /**
@@ -73,20 +99,23 @@ export class WaWebCallAudio {
     private readonly sink: WaCallAudioSink
     private readonly context: AudioContext
     private readonly ownsContext: boolean
-    private readonly microphone: MediaStream
-    private readonly ownsMicrophone: boolean
-    private readonly source: MediaStreamAudioSourceNode
     private readonly node: AudioWorkletNode
+    private readonly gain: GainNode
+    private microphone: MediaStream
+    private ownsMicrophone: boolean
+    private source: MediaStreamAudioSourceNode
+    private playoutMuted = false
     private stopping: Promise<void> | null = null
 
     private constructor(parts: WaWebCallAudioParts) {
         this.sink = parts.sink
         this.context = parts.context
         this.ownsContext = parts.ownsContext
+        this.node = parts.node
+        this.gain = parts.gain
         this.microphone = parts.microphone
         this.ownsMicrophone = parts.ownsMicrophone
         this.source = parts.source
-        this.node = parts.node
         this.node.port.onmessage = this.onCaptureBlock
     }
 
@@ -98,12 +127,15 @@ export class WaWebCallAudio {
         sink: WaCallAudioSink,
         options: WaWebCallAudioOptions = {}
     ): Promise<WaWebCallAudio> {
+        const { output } = options
         const ownsContext = options.audioContext === undefined
-        let context = options.audioContext ?? createCallAudioContext()
+        if (!ownsContext && output !== undefined) throw new Error(CALLER_CONTEXT_OUTPUT_ERROR)
+        let context = options.audioContext ?? createCallAudioContext(output)
         const ownsMicrophone = options.microphone === undefined
         let microphone = options.microphone ?? null
 
         try {
+            await routeOutput(context, output)
             microphone ??= await navigator.mediaDevices.getUserMedia(DEFAULT_MICROPHONE_CONSTRAINTS)
 
             let source: MediaStreamAudioSourceNode
@@ -113,7 +145,8 @@ export class WaWebCallAudio {
                 // Firefox refuses a mic at a foreign rate: fall back to the device rate.
                 if (!ownsContext || context.sampleRate !== WA_CALL_AUDIO_SAMPLE_RATE) throw error
                 await closeContext(context)
-                context = openAudioContext()
+                context = openAudioContext(outputOption(output))
+                await routeOutput(context, output)
                 source = context.createMediaStreamSource(microphone)
             }
 
@@ -123,6 +156,7 @@ export class WaWebCallAudio {
                 WA_CALL_AUDIO_PROCESSOR,
                 WORKLET_NODE_OPTIONS
             )
+            const gain = context.createGain()
             const audio = new WaWebCallAudio({
                 sink,
                 context,
@@ -130,15 +164,62 @@ export class WaWebCallAudio {
                 microphone,
                 ownsMicrophone,
                 source,
-                node
+                node,
+                gain
             })
             source.connect(node)
-            node.connect(context.destination)
+            node.connect(gain)
+            gain.connect(context.destination)
             return audio
         } catch (error) {
             if (ownsMicrophone && microphone) stopTracks(microphone)
             if (ownsContext) await closeContext(context)
             throw error
+        }
+    }
+
+    /**
+     * Silences the speaker, as for a hold, over a few ms. Playout is still pulled while muted,
+     * so the jitter buffer keeps draining and the call resumes in step. No-op after `stop()`.
+     */
+    setPlayoutMuted(muted: boolean): void {
+        if (this.stopping !== null || muted === this.playoutMuted) return
+        this.playoutMuted = muted
+        this.gain.gain.setTargetAtTime(
+            muted ? 0 : 1,
+            this.context.currentTime,
+            PLAYOUT_MUTE_TIME_CONSTANT_S
+        )
+    }
+
+    /**
+     * Captures from `stream`, swapping only the source node. `stream` stays the caller's to
+     * stop; if the context refuses it, this throws and the current microphone keeps running.
+     */
+    setMicrophone(stream: MediaStream): void {
+        if (this.stopping !== null) throw new Error(STOPPED_ERROR)
+        const source = this.context.createMediaStreamSource(stream)
+        source.connect(this.node)
+        this.source.disconnect()
+        if (this.ownsMicrophone) stopTracks(this.microphone)
+        this.source = source
+        this.microphone = stream
+        this.ownsMicrophone = false
+    }
+
+    /**
+     * Plays to the output device `sinkId`, `''` the default. Rejects on an `audioContext` passed
+     * in, and with a `NotSupportedError` for another device where there is no `setSinkId`.
+     * Resolves if `stop()` ends the call mid-switch, whatever the switch did. Await it before
+     * asking for another output: overlapping switches have no guaranteed order.
+     */
+    async setOutput(sinkId: string): Promise<void> {
+        if (this.stopping !== null) throw new Error(STOPPED_ERROR)
+        if (!this.ownsContext) throw new Error(CALLER_CONTEXT_OUTPUT_ERROR)
+        try {
+            await routeOutput(this.context, sinkId)
+        } catch (error) {
+            if (this.stopping === null) throw error
         }
     }
 
@@ -148,44 +229,70 @@ export class WaWebCallAudio {
         return this.stopping
     }
 
+    /** Detaches the graph, ends the processor and releases what the adapter owns. */
     private async teardown(): Promise<void> {
         this.node.port.onmessage = null
         this.source.disconnect()
         this.node.disconnect()
+        this.gain.disconnect()
         // On a shared context the node outlives us; this lets its processor end.
         this.node.port.postMessage(WA_CALL_AUDIO_STOP_MESSAGE)
         if (this.ownsMicrophone) stopTracks(this.microphone)
         if (this.ownsContext) await closeContext(this.context)
     }
 
-    /** Answers a capture block with as many playout samples, pulling even if the push throws. */
+    /**
+     * Answers a capture block with as many playout samples, written over the block itself and
+     * transferred back, pulling even if the push throws.
+     */
     private readonly onCaptureBlock = (event: MessageEvent): void => {
         const block: unknown = event.data
         if (this.stopping !== null || !(block instanceof Float32Array)) return
         try {
             this.sink.pushCapture(block)
         } finally {
-            const out = new Float32Array(block.length)
-            this.sink.pullPlayout(out)
-            this.node.port.postMessage(out, [out.buffer])
+            this.sink.pullPlayout(block)
+            this.node.port.postMessage(block, [block.buffer])
         }
     }
 }
 
 /** A 16 kHz context, so the browser resamples; the device rate where 16 kHz is refused. */
-function createCallAudioContext(): AudioContext {
+function createCallAudioContext(output: string | undefined): AudioContext {
     try {
-        return openAudioContext({ sampleRate: WA_CALL_AUDIO_SAMPLE_RATE })
+        return openAudioContext({ sampleRate: WA_CALL_AUDIO_SAMPLE_RATE, ...outputOption(output) })
     } catch {
-        return openAudioContext()
+        return openAudioContext(outputOption(output))
     }
 }
 
 /** A new context, resumed at once: past the first `await` the user activation may be gone. */
-function openAudioContext(options?: AudioContextOptions): AudioContext {
+function openAudioContext(options?: CallAudioContextOptions): AudioContext {
     const context = new AudioContext(options)
     resumeContext(context)
     return context
+}
+
+/** The constructor options that ask for `output`, none without one. */
+function outputOption(output: string | undefined): CallAudioContextOptions | undefined {
+    return output === undefined ? undefined : { sinkId: output }
+}
+
+/**
+ * Sends `context` to the output device `sinkId`, unless its constructor already did. Without
+ * `setSinkId` a context already plays to the default device, `''`.
+ */
+async function routeOutput(context: AudioContext, sinkId: string | undefined): Promise<void> {
+    const routing = context as AudioOutputRouting
+    if (sinkId === undefined || routing.sinkId === sinkId) return
+    if (routing.setSinkId !== undefined) {
+        await routing.setSinkId(sinkId)
+    } else if (sinkId !== '') {
+        throw new DOMException(
+            'this browser cannot choose the output of an AudioContext',
+            'NotSupportedError'
+        )
+    }
 }
 
 /**

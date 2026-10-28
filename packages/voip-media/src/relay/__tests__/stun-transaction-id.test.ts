@@ -4,14 +4,15 @@ import { test } from 'node:test'
 import { hexToBytes, peerConnectionNotDialled } from '../../__tests__/_helpers.js'
 import { bytesToHex, TEXT_ENCODER } from '../../bytes.js'
 import { nodeCrypto } from '../../node/crypto.js'
+import type { Connection } from '../leg.js'
+import { buildSSRCSubscriptionList } from '../stun-subscriptions.js'
 import {
     buildAllocateForRelay,
-    buildSSRCSubscriptionList,
     createStunTransactionId,
     parseStunResponse,
     type StunResponseInfo
 } from '../stun.js'
-import { type Connection, WaSctpRelay } from '../WaSctpRelay.js'
+import { WaSctpRelay } from '../WaSctpRelay.js'
 
 const ATTR_USERNAME = 0x0006
 const ATTR_XOR_RELAYED_ADDRESS = 0x0016
@@ -62,7 +63,7 @@ function relayInfoFor(index: number) {
  * A `channel` stand-in that records every frame `sendToChannel` writes to it
  * without any real transport underneath. This covers the data channel legs
  * only: the connections built here carry no `rawLeg`, and a raw UDP leg takes
- * the other branch of `isConnOpen`/`sendToChannel` and registers with a bare
+ * the other branch of `isLegOpen`/`sendToChannel` and registers with a bare
  * allocate instead of this binding ladder. That its allocate and its ping
  * share one transaction id is asserted in `raw-udp-relay.test.ts`.
  */
@@ -84,18 +85,16 @@ function makeOpenConnection(
         peerConnection: null,
         channel: fakeChannel(sent),
         incomingChannels: [],
-        buffer: [],
-        bufferedBytes: 0,
         id: relayInfo.id,
         relayInfo,
         connectionTimeout: null,
+        iceDisconnectTimers: new Set(),
         hasReceivedFirstPacket: false,
         /**
          * The surviving (only) connection path always carries a local ufrag,
          * taken from the WebRTC SDP offer before the relay is dialled.
          */
         localUfrag: `local-ufrag-${relayInfo.relayId}`,
-        stableRoutingConnId: 0n,
         stunTransactionId: createStunTransactionId(),
         stats: { sentPackets: 0, receivedPackets: 0, sentBytes: 0, receivedBytes: 0 }
     } as unknown as Connection
@@ -153,7 +152,7 @@ test('a relay connection stamps one transaction id on every STUN message it emit
     relay.setSubscriptionSsrc(0x55667788)
 
     /**
-     * `sendStunAllocateOnOpen`/`startKeepalive` are exercised directly
+     * `registration.sendStunAllocateOnOpen`/`keepalive.start` are exercised directly
      * against a fake channel instead of going through `startConnection`: the
      * real path needs a live WebRTC/ICE negotiation to open `conn.channel`,
      * which this unit test has no interest in driving. Typed against the
@@ -161,8 +160,8 @@ test('a relay connection stamps one transaction id on every STUN message it emit
      * time instead of silently matching a stale structural type.
      */
     const internals = relay as unknown as {
-        sendStunAllocateOnOpen: (conn: Connection, relayInfo: unknown) => void
-        startKeepalive: (connectionId: string, conn: Connection) => void
+        registration: { sendStunAllocateOnOpen: (conn: Connection, relayInfo: unknown) => void }
+        keepalive: { start: (conn: Connection) => void }
     }
 
     const perConnectionSent: Uint8Array[][] = []
@@ -174,8 +173,8 @@ test('a relay connection stamps one transaction id on every STUN message it emit
             perConnectionSent.push(sent)
 
             const conn = makeOpenConnection(relayInfo, sent)
-            internals.sendStunAllocateOnOpen(conn, relayInfo)
-            internals.startKeepalive(conn.id, conn)
+            internals.registration.sendStunAllocateOnOpen(conn, relayInfo)
+            internals.keepalive.start(conn)
         }
 
         await waitUntil(
@@ -295,5 +294,54 @@ test('the relay key of two real connections is the header transaction id word by
 
         assert.deepEqual([...key.subarray(0, 4)], [...MAGIC_COOKIE_BYTES])
         assert.equal(bytesToHex(key.subarray(4)), relayKey, headerId)
+    }
+})
+
+test('a resent allocate repeats the bytes a fresh build gives, and an ssrc change rebuilds it', () => {
+    const relay = new WaSctpRelay({
+        crypto: nodeCrypto,
+        createPeerConnection: peerConnectionNotDialled
+    })
+    relay.setSsrc(0x11223344)
+    relay.setSubscriptionSsrc(0x55667788)
+    const relayInfo = relayInfoFor(1)
+    const sent: Uint8Array[] = []
+    const conn = makeOpenConnection(relayInfo, sent)
+    const internals = relay as unknown as { connections: Map<string, Connection> }
+    internals.connections.set(conn.id, conn)
+
+    const lastAllocate = (): string => {
+        const allocates = sent.filter((packet) => parseStunResponse(packet)?.method === 'allocate')
+        assert.ok(allocates.length > 0)
+        return bytesToHex(allocates[allocates.length - 1])
+    }
+    const built = (self: number, peer: number, selfPid: number, peerPid: number): string =>
+        bytesToHex(
+            buildAllocateForRelay(
+                nodeCrypto,
+                relayInfo.rawToken,
+                buildSSRCSubscriptionList([self], [peer], selfPid, peerPid),
+                TEXT_ENCODER.encode(relayInfo.key),
+                relayInfo.ip,
+                relayInfo.port,
+                conn.stunTransactionId
+            )
+        )
+
+    try {
+        relay.resendSubscriptions()
+        const first = lastAllocate()
+        assert.equal(first, built(0x11223344, 0x55667788, 0, 0))
+        relay.resendSubscriptions()
+        assert.equal(lastAllocate(), first)
+
+        relay.setSsrc(0x01020304)
+        relay.resendSubscriptions()
+        assert.equal(lastAllocate(), built(0x01020304, 0x55667788, 0, 0))
+
+        relay.setParticipantIds(7, 9)
+        assert.equal(lastAllocate(), built(0x01020304, 0x55667788, 7, 9))
+    } finally {
+        relay.cleanup()
     }
 })

@@ -135,6 +135,29 @@ test('resolveButtonAddonKind classifies list/interactive incl. documentWithCapti
         }),
         'order_details'
     )
+    assert.equal(
+        resolveButtonAddonKind({
+            interactiveMessage: {
+                nativeFlowMessage: {
+                    buttons: [{ name: 'form_message', buttonParamsJson: '{}' }]
+                }
+            }
+        }),
+        'form_message'
+    )
+    assert.equal(
+        resolveButtonAddonKind({
+            interactiveMessage: {
+                nativeFlowMessage: {
+                    buttons: [
+                        { name: 'cta_url', buttonParamsJson: '{}' },
+                        { name: 'form_message', buttonParamsJson: '{}' }
+                    ]
+                }
+            }
+        }),
+        'interactive'
+    )
     assert.equal(resolveButtonAddonKind({ interactiveMessage: {} }), null)
     assert.equal(resolveButtonAddonKind({ conversation: 'hi' }), null)
     assert.equal(
@@ -163,6 +186,27 @@ test('resolveEncMediaType maps protobuf to correct media type string', () => {
     assert.equal(resolveEncMediaType({ videoMessage: { gifPlayback: true } }), 'gif')
     assert.equal(resolveEncMediaType({ audioMessage: { ptt: true } }), 'ptt')
     assert.equal(resolveEncMediaType({ documentMessage: {} }), 'document')
+})
+
+test('resolveEncMediaType tags an album as a collection, also through wrappers', () => {
+    assert.equal(resolveEncMediaType({ albumMessage: { expectedImageCount: 2 } }), 'collection')
+    assert.equal(
+        resolveEncMediaType({ ephemeralMessage: { message: { albumMessage: {} } } }),
+        'collection'
+    )
+    assert.equal(resolveMessageTypeAttr({ albumMessage: {} }), 'media')
+})
+
+test('resolveEncMediaType leaves non-album messages untouched', () => {
+    assert.equal(resolveEncMediaType({ conversation: 'hi' }), null)
+    assert.equal(resolveEncMediaType({ imageMessage: {} }), 'image')
+    assert.equal(
+        resolveEncMediaType({
+            extendedTextMessage: { text: 'link', matchedText: 'https://x.com' }
+        }),
+        'url'
+    )
+    assert.equal(resolveEncMediaType({ messageHistoryBundle: {} }), 'group_history')
 })
 
 test('resolveMetaAttrs returns attrs for polls events and view-once', () => {
@@ -225,7 +269,8 @@ test('resolveOutboundMessageAttrs matches the individual resolvers', () => {
         { viewOnceMessage: { message: { imageMessage: { url: 'x' } } } },
         { ephemeralMessage: { message: { viewOnceMessageV2: { message: { videoMessage: {} } } } } },
         { deviceSentMessage: { message: { extendedTextMessage: { text: 'ds' } } } },
-        { groupStatusMessageV2: { message: { imageMessage: { url: 'x' } } } }
+        { groupStatusMessageV2: { message: { imageMessage: { url: 'x' } } } },
+        { albumMessage: { expectedImageCount: 2 } }
     ]
     for (const message of corpus) {
         const combined = resolveOutboundMessageAttrs(message)

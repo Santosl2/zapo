@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import type { BinaryNode } from 'zapo-js/transport'
+import { bytesToBase64, TEXT_ENCODER } from 'zapo-js/util'
 
-import { bytesToBase64, TEXT_ENCODER } from '../../bytes.js'
 import { parseVoipSettings, WaVoipSettings } from '../voip-settings.js'
 
 /**
@@ -230,6 +230,28 @@ test('rtcp_interval_ms comes out of rc, and only when positive', () => {
     assert.equal(absent.rtcpIntervalMs, 1_500, 'the fixture carries the observed interval')
 })
 
+test('frame_ms comes out of encode and maxfpp out of rc, and only when positive', () => {
+    const live = parseVoipSettings(
+        offerWith(
+            toBase64Json({
+                encode: { frame_ms: '60', max_frames_per_packet: '3' },
+                rc: { maxfpp: '2', minfpp: '1' }
+            })
+        )
+    )
+    const zero = parseVoipSettings(
+        offerWith(toBase64Json({ encode: { frame_ms: '0' }, rc: { maxfpp: '0' } }))
+    )
+    const absent = parseFixture()
+
+    assert.equal(live?.audioFrameMs, 60)
+    assert.equal(live?.audioMaxFramesPerPacket, 2, 'rc.maxfpp, not encode.max_frames_per_packet')
+    assert.equal(zero?.audioFrameMs, null)
+    assert.equal(zero?.audioMaxFramesPerPacket, null)
+    assert.equal(absent.audioFrameMs, null)
+    assert.equal(absent.audioMaxFramesPerPacket, null)
+})
+
 test('each media profile is read for what it actually carries', () => {
     const audio = parseVoipSettings(offerWith(toBase64Json(AUDIO_PROFILE)))
     const video = parseVoipSettings(offerWith(toBase64Json(VIDEO_PROFILE)))
@@ -308,4 +330,38 @@ test('fromJson rejects a root that is not an object', () => {
     assert.equal(WaVoipSettings.fromJson('null'), null)
     assert.equal(WaVoipSettings.fromJson('7'), null)
     assert.ok(WaVoipSettings.fromJson('{}'))
+})
+
+test('the options and sframe keys the call applies come out typed, defaulting when absent', () => {
+    const set = parseVoipSettings(
+        offerWith(
+            toBase64Json({
+                options: {
+                    video_state_txn_id_recv_enforce: '1',
+                    heartbeat_interval_s: '15',
+                    enable_app_data_stream: 'true',
+                    app_data_stream_version: '2'
+                },
+                sframe: { enable_sframe: '1', enable_sframe_rx: '0' }
+            })
+        )
+    )
+    const zero = parseVoipSettings(
+        offerWith(toBase64Json({ options: { heartbeat_interval_s: '0' } }))
+    )
+    const absent = parseFixture()
+
+    assert.equal(set?.videoStateTxnRecvEnforce, true)
+    assert.equal(set?.heartbeatIntervalMs, 15_000)
+    assert.equal(set?.appDataStream, true)
+    assert.equal(set?.appDataStreamVersion, 2)
+    assert.equal(set?.sframe, true)
+    assert.equal(set?.sframeRx, false)
+    assert.equal(zero?.heartbeatIntervalMs, null)
+    assert.equal(absent.videoStateTxnRecvEnforce, false)
+    assert.equal(absent.heartbeatIntervalMs, null)
+    assert.equal(absent.appDataStream, false)
+    assert.equal(absent.appDataStreamVersion, 0)
+    assert.equal(absent.sframe, false)
+    assert.equal(absent.sframeRx, false)
 })

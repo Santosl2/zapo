@@ -40,6 +40,9 @@ const plane = new WaCallMediaPlane({
     onRelayLost: (reason) => {
         // no leg left - tell signaling, which ends the call
     },
+    onRelayAnswered: (name, rttMs) => {
+        // a relay answered for the first time - tell signaling, which names only these to the peer
+    },
     onReaction: (reaction) => {
         // an in-band emoji reaction from the peer
     }
@@ -72,6 +75,47 @@ those instants carry, a pause in the capture goes out as a marked jump, and capt
 of the clock is shed. `sendVideoFrame` takes the host's own capture timestamp in any epoch and maps
 it onto the same clock.
 
+## The codec
+
+Audio is MLow at 16 kHz mono in 60 ms frames. When the plan's settings carry
+`audioFramesPerPacket: 2` (the server's `rc.maxfpp`), two frames share one packet the way the
+official 1:1 client sends them, `[0x92][0x02][length of the first][0x50 ...]`, 120 ms per packet;
+a frame with the VAD bit clear always goes alone. On receive, each sub-frame sits on the RTP
+timeline at its packet's timestamp plus the durations its TOCs give the sub-frames before it, which
+is how the official packets add up. A sub-frame whose stretch already played is a
+redundant copy and is dropped; one that lands where a lost packet left a hole plays in its place.
+Audio a peer sends on PT 121 (`mlow-red-1`) plays on the same timeline, its sequence numbers kept
+apart from PT 120's, so a slot both carry plays once; a PT 121 packet that parses neither as MLow
+nor as in-band RED is dropped and counted in `audioRedDiscarded`.
+
+Once per RTCP interval the plane sends a REMB (PSFB 206, FMT 15) on the peer's audio stream: the
+peer's audio quality control stays in its 15 kbps probing state until one arrives. The value is an
+estimate of our own, 24 kbps at first, 10% up per clean interval to 30 kbps and steady there, 15%
+down from 10% loss, never under 16 kbps. The peer takes the lower of it and its own estimate, so
+the ceiling sits just over its 24 kbps managed band instead of leaving the state to that estimate.
+
+Two options on the plane, also accepted by `WaCallMediaReceiver` on a remote host:
+
+- `mlowCompanionModel`: the weights of the MLow Companion, the neural post-filter WhatsApp runs
+  in its decoder, as bytes or as a loader the plane calls when a call loads the codec. They are
+  WhatsApp's `mlow_companion_v1.pte`, a `DNNw` blob despite the extension, and no package ships
+  them. The library documents it for 20 ms wideband mono frames; measured on 0.2.0 it also
+  reshapes the 60 ms frames of a 1:1 call, at about 40 times the decode CPU (around 4% of one
+  core per stream). Weights that fail to load leave the call decoding without it, with a warning.
+- `mlowRed`: sends RED as a plain two-frame multiframe, the low-rate copy of the previous frame
+  then the frame, stamped with the copy's timestamp. The copy lands on the slot the previous
+  packet filled, so a receiver that orders by timestamp drops it unless that packet was lost.
+  Against WA Web it kept concealment at 3.1% under about 18% loss, with no negotiation. The
+  official in-band layout, a compact RFC 2198 on PT 121, is read on receive and never sent.
+  Off by default; turning it on turns DTX off, which RED requires.
+
+```ts
+const plane = new WaCallMediaPlane({
+    ...webMediaHost,
+    mlowCompanionModel: () => fetch('/models/mlow_companion_v1.pte').then((r) => r.arrayBuffer())
+})
+```
+
 ## Audio in a browser
 
 `WaWebCallAudio` carries that clock for you: it opens the microphone and the speaker and drives
@@ -94,6 +138,45 @@ and falls back to the device rate, converting in the worklet, where the browser 
 `microphone` or `audioContext` passed in stays the caller's to stop or close. Under a CSP that
 forbids `blob:` scripts, serve `WA_CALL_AUDIO_WORKLET_SOURCE` as a file and pass its URL as
 `workletUrl`.
+
+Three controls change a running call without rebuilding the graph:
+
+```ts
+const audio = await WaWebCallAudio.start(plane, { output: speakerId })
+
+// Hold: the speaker goes quiet, the call keeps its timeline.
+audio.setPlayoutMuted(true)
+
+// Another microphone: only the source node is swapped.
+const microphone = await navigator.mediaDevices.getUserMedia({
+    audio: { deviceId: { exact: microphoneId } }
+})
+audio.setMicrophone(microphone)
+
+// Another speaker or headset.
+await audio.setOutput(headsetId)
+```
+
+- `setPlayoutMuted(muted)` ramps a gain between the worklet and the speaker over a few
+  milliseconds, so it does not click. Playout is still pulled while muted: the jitter buffer keeps
+  draining, and the call comes back from hold in step. It mutes the speaker only; muting the
+  microphone is the plane's job. After `stop()` it does nothing.
+- `setMicrophone(stream)` connects a source on `stream` to the running worklet before it lets the
+  old one go, so capture has no gap. A stream the context refuses (Firefox, for a microphone at a
+  rate other than the context's) throws and leaves the current microphone running. A microphone
+  the adapter opened is stopped when replaced; `stream` stays the caller's, and `stop()` does not
+  stop it. It throws after `stop()`.
+- `setOutput(sinkId)` and the `output` option pick the output device, an id from
+  `enumerateDevices()`; `''` is the default device. `output` goes to the context's constructor as
+  its `sinkId` option, or to `AudioContext.setSinkId` where the constructor ignores it;
+  `setOutput` calls `setSinkId`. Chrome and Edge have both; Firefox and Safari have neither, and
+  there any device but `''`, which their contexts already play to, makes `setOutput` reject with
+  a `NotSupportedError` and `start` fail before asking for the microphone, releasing what it
+  opened. With `output` the context is still the adapter's, so it is still resumed and still
+  falls back to the device rate. If `stop()` ends the call mid-switch, `setOutput` resolves.
+  Await it before asking for another output: overlapping switches have no guaranteed order.
+  A context passed in as `audioContext` keeps its own output: `start` refuses `output` with one
+  and `setOutput` rejects, so route it with its own `setSinkId`.
 
 ## Video in a browser
 

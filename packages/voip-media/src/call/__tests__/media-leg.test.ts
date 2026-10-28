@@ -4,7 +4,7 @@ import { test } from 'node:test'
 import { peerConnectionNotDialled } from '../../__tests__/_helpers.js'
 import { createNoopLogger } from '../../logger.js'
 import { nodeCrypto } from '../../node/crypto.js'
-import type { RawUdpLegOptions } from '../../relay/WaSctpRelay.js'
+import type { RawUdpLegOptions } from '../../relay/leg.js'
 import type { SrtpKeyingMaterial } from '../../types.js'
 import type { WaCallMediaRelay, WaCallMediaSsrcs } from '../plan.js'
 import { WaCallMediaPlane } from '../WaCallMediaPlane.js'
@@ -69,7 +69,10 @@ const FRAME_SAMPLES = 960
 /** A codec that encodes any frame into the same few bytes. */
 const FAKE_CODEC = {
     getFrameSize: () => FRAME_SAMPLES,
-    encode: () => new Uint8Array([0xf8, 0xff, 0xfe]),
+    encodeInto: (_frame: Float32Array, target: Uint8Array) => {
+        target.set([0xf8, 0xff, 0xfe])
+        return 3
+    },
     resetSequence: () => {},
     decodeSequenced: () => {},
     setExpectedPacketLossPercent: () => {},

@@ -5,7 +5,7 @@ import { peerConnectionNotDialled } from '../../__tests__/_helpers.js'
 import { readUInt32BE } from '../../bytes.js'
 import { createNoopLogger } from '../../logger.js'
 import { type MLowCodec } from '../../media/mlow-codec.js'
-import { SenderReportSchedule } from '../../media/rtcp.js'
+import { SenderReportSchedule } from '../../media/rtcp-policy.js'
 import { RtpHeader, RtpPacket, RtpSession } from '../../media/rtp.js'
 import { nodeCrypto } from '../../node/crypto.js'
 import type { WaCallMediaSettings } from '../plan.js'
@@ -68,7 +68,7 @@ interface PlaneInternals {
         setSubscriptionSsrc: (ssrc: number) => void
         resendSubscriptions: () => void
     }
-    receiverEstimateSchedule: SenderReportSchedule
+    rtcp: { receiverEstimateSchedule: SenderReportSchedule }
     onRelayData: (data: Uint8Array) => void
 }
 
@@ -126,7 +126,10 @@ async function createPlane(
     internals.rtpSession = RtpSession.whatsappOpus(SELF_AUDIO_SSRC)
     internals.codec = {
         getFrameSize: () => AUDIO_SAMPLES_PER_PACKET,
-        encode: () => OPUS_FRAME,
+        encodeInto: (_frame: Float32Array, target: Uint8Array) => {
+            target.set(OPUS_FRAME)
+            return OPUS_FRAME.length
+        },
         resetSequence: () => {},
         getStats: () => ({ success: 0, errors: 0 }),
         destroy: () => {}
@@ -134,7 +137,7 @@ async function createPlane(
     if (mediaType === 'video') {
         internals.videoRtpSession = new RtpSession(SELF_VIDEO_SSRC, 97)
         if (overrideEstimateSchedule) {
-            internals.receiverEstimateSchedule = SenderReportSchedule.onWallClock(0)
+            internals.rtcp.receiverEstimateSchedule = SenderReportSchedule.onWallClock(0)
         }
     }
     await plane.apply({ accepted: true })

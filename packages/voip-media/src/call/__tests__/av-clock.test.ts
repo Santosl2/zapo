@@ -4,7 +4,7 @@ import { test } from 'node:test'
 import { peerConnectionNotDialled } from '../../__tests__/_helpers.js'
 import { readUInt32BE } from '../../bytes.js'
 import { createNoopLogger } from '../../logger.js'
-import { SenderReportSchedule } from '../../media/rtcp.js'
+import { SenderReportSchedule } from '../../media/rtcp-policy.js'
 import { RtpPacket } from '../../media/rtp.js'
 import { MEDIA_CLOCK_ORIGIN_LEAD_MS } from '../../media/WaMediaClock.js'
 import { nodeCrypto } from '../../node/crypto.js'
@@ -97,10 +97,11 @@ class FakeCodec {
     getFrameSize(): number {
         return FRAME_SAMPLES
     }
-    encode(): Uint8Array {
+    encodeInto(_frame: Float32Array, target: Uint8Array): number {
         this.encodes++
         if (this.failOn.has(this.encodes)) throw new Error('encoder fault')
-        return OPUS_FRAME
+        target.set(OPUS_FRAME)
+        return OPUS_FRAME.length
     }
     resetSequence(): void {}
     decodeSequenced(): void {}
@@ -116,8 +117,10 @@ interface PlaneInternals {
     codec: FakeCodec
     srtpSession: { protect: (packet: RtpPacket) => Uint8Array }
     srtcpContext: { protect: (rtcp: Uint8Array) => Uint8Array }
-    audioReportSchedule: SenderReportSchedule
-    videoReportSchedule: SenderReportSchedule
+    rtcp: {
+        audioReportSchedule: SenderReportSchedule
+        videoReportSchedule: SenderReportSchedule
+    }
 }
 
 interface Harness {
@@ -557,8 +560,11 @@ test('video timestamps only go forward, whatever the host stamps', async () => {
 /** Stamped with the packet's own timestamp, a report lags by each stream's own delay. */
 test('the sender reports of both streams carry the clock at the instant they are assembled', async () => {
     const harness = await createPlane('video')
-    harness.internals.audioReportSchedule = SenderReportSchedule.onMediaClock(0, AUDIO_CLOCK_RATE)
-    harness.internals.videoReportSchedule = SenderReportSchedule.onWallClock(0)
+    harness.internals.rtcp.audioReportSchedule = SenderReportSchedule.onMediaClock(
+        0,
+        AUDIO_CLOCK_RATE
+    )
+    harness.internals.rtcp.videoReportSchedule = SenderReportSchedule.onWallClock(0)
 
     for (let frame = 0; frame < 4; frame++) {
         const captured = START_MS + frame * FRAME_MS

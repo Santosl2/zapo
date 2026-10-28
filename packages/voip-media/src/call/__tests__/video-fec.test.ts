@@ -4,7 +4,7 @@ import { test } from 'node:test'
 import { peerConnectionNotDialled } from '../../__tests__/_helpers.js'
 import { writeUInt16BE, writeUInt32BE } from '../../bytes.js'
 import { createNoopLogger } from '../../logger.js'
-import { RtpStreamReception } from '../../media/rtcp.js'
+import { RtpStreamReception } from '../../media/rtp-stream-reception.js'
 import { RtpHeader, RtpPacket } from '../../media/rtp.js'
 import { nodeCrypto } from '../../node/crypto.js'
 import type { InboundVideoFrame, InboundVideoRtpPacket } from '../../types.js'
@@ -22,9 +22,11 @@ const OPUS_PAYLOAD_TYPE = 120
  * The FEC family inside the 7 bits of the PT field: `103 + 3k`, k from 0 to
  * 8. Only 103 and 106 showed up in capture; the rest is the formula, listed
  * here so a new k does not fall back into the video branch without anyone
- * noticing.
+ * noticing. 121 (`103 + 3 * 6`) is missing on purpose: it is `mlow-red-1`, audio.
  */
-const FEC_PAYLOAD_TYPES = [103, 106, 109, 112, 115, 118, 121, 124, 127]
+const FEC_PAYLOAD_TYPES = [103, 106, 109, 112, 115, 118, 124, 127]
+/** `mlow-red-1`, where a peer that negotiated it sends all of its audio. */
+const MLOW_RED_PAYLOAD_TYPE = 121
 
 /** Video clock, the unit of the RTP timestamps below. */
 const VIDEO_CLOCK_RATE = 90_000
@@ -54,7 +56,7 @@ interface PlaneInternals {
     videoReception: RtpStreamReception
     videoRecvPackets: number
     reedSolomonFecPackets: number
-    inboundVideoStreams: Map<number, { keyFrameReceived: boolean }>
+    inboundVideo: { streams: Map<number, { keyFrameReceived: boolean }> }
     onRelayData: (data: Uint8Array) => void
 }
 
@@ -101,7 +103,7 @@ async function createPlane(): Promise<FecHarness> {
 
 /** Whether any inbound video stream got a key frame. */
 function keyFrameReceived(internals: PlaneInternals): boolean {
-    return [...internals.inboundVideoStreams.values()].some((stream) => stream.keyFrameReceived)
+    return [...internals.inboundVideo.streams.values()].some((stream) => stream.keyFrameReceived)
 }
 
 /** An RTP packet as the peer sends it, with marker set to close the frame. */
@@ -189,6 +191,21 @@ test('the opus payload type is outside the fec family', async () => {
     )
 
     assert.equal(harness.internals.reedSolomonFecPackets, 0, '120 is not 103 + 3k')
+    harness.plane.stop()
+})
+
+test('the separate RED audio payload type is audio, not read as video parity', async () => {
+    const harness = await createPlane()
+
+    const payload = new Uint8Array(200).fill(0x5a)
+    payload.set([0x92, 0x02, 0x71, 0x50])
+    harness.internals.onRelayData(inboundPacket(MLOW_RED_PAYLOAD_TYPE, PEER_AUDIO_SSRC, payload))
+
+    assert.equal(harness.internals.reedSolomonFecPackets, 0, '121 is audio, not 103 + 3 * 6')
+    assert.equal(harness.internals.videoRecvPackets, 0)
+    assert.equal(harness.frames.length, 0)
+    assert.equal(harness.packets.length, 0)
+    assert.equal(harness.plane.getStats().audioRedDiscarded, 0, 'it parses as MLow')
     harness.plane.stop()
 })
 

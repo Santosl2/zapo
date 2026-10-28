@@ -127,9 +127,31 @@ test('the server settings reach the media resolved', () => {
     assert.deepEqual(harness.link.plan.settings, {
         rtcpIntervalMs: 1500,
         disableRtcpRemb: true,
-        appDataSframe: true
+        appDataSframe: true,
+        audioFramesPerPacket: 1
     })
     harness.session.cleanup()
+})
+
+test('maxfpp bundles the 60 ms audio frames two to a packet, and no further', () => {
+    const cases: ReadonlyArray<readonly [Record<string, unknown>, number]> = [
+        [{ encode: { frame_ms: '60' }, rc: { maxfpp: '2', minfpp: '1' } }, 2],
+        [{ rc: { maxfpp: '2' } }, 2],
+        [{ rc: { maxfpp: '3' } }, 2],
+        [{ rc: { maxfpp: '1' } }, 1],
+        [{ encode: { frame_ms: '20' }, rc: { maxfpp: '2' } }, 1],
+        [{ encode: { frame_ms: '60' } }, 1]
+    ]
+    for (const [json, expected] of cases) {
+        const harness = createSession()
+        harness.session.applyVoipSettings(WaVoipSettings.fromJson(JSON.stringify(json)))
+        assert.equal(
+            harness.link.plan.settings?.audioFramesPerPacket,
+            expected,
+            JSON.stringify(json)
+        )
+        harness.session.cleanup()
+    }
 })
 
 /** SFrame on the app data takes both gates: with either off the peer expects no trailer. */
@@ -236,6 +258,7 @@ function remoteEvents(messages: WaCallMediaMessage[]): {
             onRelayLost: (reason) => {
                 counts.lost.push(reason)
             },
+            onRelayAnswered: () => {},
             onReaction: () => {},
             onInboundAudio: () => {},
             onInboundVideoRtp: () => {},
@@ -323,11 +346,6 @@ test('stopped remote media publishes and reports nothing more', async () => {
     assert.equal(counts.active, 0)
 })
 
-interface PublishingInternals {
-    publish(update: Record<string, unknown>): Promise<void>
-    deriveKeys(): { epoch: number } | null
-}
-
 /** On a remote host every section is a message on the wire; an unchanged one is noise. */
 test('a section identical to the one last published is not handed over again', () => {
     const harness = createSession()
@@ -337,47 +355,5 @@ test('a section identical to the one last published is not handed over again', (
     harness.session.applyVoipSettings(settings)
 
     assert.equal(harness.link.sections('settings').length, 1)
-    harness.session.cleanup()
-})
-
-test('an update keeps only the sections that changed, and an empty one is not sent', async () => {
-    const harness = createSession()
-    const internals = harness.session as unknown as PublishingInternals
-
-    await internals.publish({ mediaType: 'audio', muted: false })
-    await internals.publish({ mediaType: 'audio', muted: true })
-    await internals.publish({ mediaType: 'audio', muted: true })
-
-    assert.deepEqual(harness.link.updates, [{ mediaType: 'audio', muted: false }, { muted: true }])
-    harness.session.cleanup()
-})
-
-/** A relay list handed over again is how a media side with no leg left is asked to dial. */
-test('relays are handed over again even when they did not change', async () => {
-    const harness = createSession()
-    const internals = harness.session as unknown as PublishingInternals
-    const relays = { endpoints: [], selfPid: 1, peerPid: 2 }
-
-    await internals.publish({ relays })
-    await internals.publish({ relays: { ...relays } })
-
-    assert.equal(harness.link.sections('relays').length, 2)
-    harness.session.cleanup()
-})
-
-/** The accept re-derives the keys the ack already did; that is not a key change. */
-test('keys derived again to the same material keep their epoch', () => {
-    const harness = createSession()
-    harness.call.encryptionKey = new Uint8Array(32).fill(7)
-    const internals = harness.session as unknown as PublishingInternals
-
-    const first = internals.deriveKeys()
-    const again = internals.deriveKeys()
-    harness.call.encryptionKey = new Uint8Array(32).fill(8)
-    const changed = internals.deriveKeys()
-
-    assert.ok(first && again && changed)
-    assert.equal(again.epoch, first.epoch)
-    assert.equal(changed.epoch, first.epoch + 1)
     harness.session.cleanup()
 })

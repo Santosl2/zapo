@@ -130,16 +130,18 @@ async function resolveBytesThumbnailFields(
                 deps.logger.warn('link preview thumbnail upload failed', {
                     attempt,
                     maxAttempts: THUMBNAIL_UPLOAD_MAX_ATTEMPTS,
-                    message: toError(error).message
+                    message: toError(error).message,
+                    error
                 })
                 break
             }
             const delayMs =
                 THUMBNAIL_UPLOAD_BASE_DELAY_MS * 2 ** (attempt - 1) * (0.5 + Math.random())
-            deps.logger.warn('link preview thumbnail upload failed, retrying', {
+            deps.logger.warn('retrying failed link preview thumbnail upload ', {
                 attempt,
                 maxAttempts: THUMBNAIL_UPLOAD_MAX_ATTEMPTS,
                 delayMs: Math.round(delayMs),
+                error,
                 message: toError(error).message
             })
             await delay(delayMs)

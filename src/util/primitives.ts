@@ -6,9 +6,23 @@ const SIGNED_DIGITS_RE = /^-?\d+$/
  * returned unchanged, strings/numbers are wrapped, and objects with `message`
  * or `code` fields are mapped to readable messages. Use in `catch` blocks
  * before logging.
+ *
+ * An `Error` with an empty `message` (Node's `AggregateError` from a failed
+ * dual-stack connect, for example) keeps its identity but gets a message
+ * derived from its `name`, `code`, nested `errors` and `cause`, so logs
+ * never show `message: ""`.
  */
 export function toError(value: unknown): Error {
-    if (value instanceof Error) return value
+    if (value instanceof Error) {
+        try {
+            if (value.message.length === 0) {
+                value.message = describeEmptyError(value, 0)
+            }
+        } catch {
+            // ignore errors while describing the error
+        }
+        return value
+    }
     if (typeof value === 'string') return new Error(value)
     if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
         return new Error(String(value))
@@ -24,6 +38,36 @@ export function toError(value: unknown): Error {
         }
     }
     return new Error('unknown error')
+}
+
+const DESCRIBE_ERROR_MAX_DEPTH = 3
+
+function describeEmptyError(error: Error, depth: number): string {
+    const code = (error as { readonly code?: unknown }).code
+    const head =
+        typeof code === 'string' || typeof code === 'number'
+            ? `${error.name} (${code})`
+            : error.name
+    if (depth >= DESCRIBE_ERROR_MAX_DEPTH) return head
+    const details: string[] = []
+    const nested = (error as { readonly errors?: unknown }).errors
+    if (Array.isArray(nested)) {
+        for (const inner of nested) {
+            details.push(describeNestedError(inner, depth + 1))
+        }
+    }
+    const cause = (error as { readonly cause?: unknown }).cause
+    if (cause !== undefined) {
+        details.push(`cause: ${describeNestedError(cause, depth + 1)}`)
+    }
+    return details.length > 0 ? `${head}: ${details.join('; ')}` : head
+}
+
+function describeNestedError(value: unknown, depth: number): string {
+    if (value instanceof Error) {
+        return value.message.length > 0 ? value.message : describeEmptyError(value, depth)
+    }
+    return toError(value).message
 }
 
 function assertSafeInteger(

@@ -334,6 +334,25 @@ test('primitives helpers normalize errors and long/safe numbers', () => {
     assert.equal(toError({ message: 'from object' }).message, 'from object')
     assert.equal(toError({ code: 'EFAIL' }).message, 'unknown error (EFAIL)')
 
+    // Shape of Node's dual-stack connect failure: an AggregateError with an empty message.
+    const connectFailure = Object.assign(new Error(''), {
+        name: 'AggregateError',
+        code: 'ETIMEDOUT',
+        errors: [
+            new Error('connect ETIMEDOUT 1.2.3.4:443'),
+            new Error('connect ENETUNREACH ::1:443')
+        ]
+    })
+    const normalized = toError(connectFailure)
+    assert.equal(normalized, connectFailure)
+    assert.equal(
+        normalized.message,
+        'AggregateError (ETIMEDOUT): connect ETIMEDOUT 1.2.3.4:443; connect ENETUNREACH ::1:443'
+    )
+    const withCause = Object.assign(new Error(''), { cause: new TypeError('bad') })
+    assert.equal(toError(withCause).message, 'Error: cause: bad')
+    assert.equal(toError(new Error('')).message, 'Error')
+
     assert.equal(toSafeNumber(12, 'field'), 12)
     assert.equal(toSafeNumber({ toNumber: () => 33 }, 'field'), 33)
     assert.throws(() => toSafeNumber(undefined, 'field'), /missing field/)

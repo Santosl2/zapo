@@ -5,6 +5,7 @@ import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClien
 import { proto } from '@proto'
 import { toProxyAgent } from '@transport/proxy'
 import type { WaProxyTransport } from '@transport/types'
+import { delay } from '@util/async'
 import { TEXT_DECODER } from '@util/bytes'
 import { parseOptionalInt, toError } from '@util/primitives'
 
@@ -21,6 +22,8 @@ const DEFAULT_HTML_BYTES = 65_536
 const DEFAULT_THUMBNAIL_BYTES = 262_144
 const INLINE_THUMBNAIL_MAX_BYTES = 64 * 1024
 const MAX_REDIRECTS = 5
+const HTML_FETCH_MAX_ATTEMPTS = 3
+const HTML_FETCH_BASE_DELAY_MS = 250
 
 export interface DefaultLinkPreviewFetcherOptions {
     readonly mediaTransfer: WaMediaTransferClient
@@ -55,25 +58,44 @@ export function createDefaultLinkPreviewFetcher(
                 title: input.url.hostname,
                 previewType: proto.Message.ExtendedTextMessage.PreviewType.NONE
             }
-            let html: string
-            try {
-                html = await fetchHtml(input.url, {
-                    mediaTransfer,
-                    agent,
-                    userAgent,
-                    timeoutMs: fetchTimeoutMs,
-                    maxBytes: maxHtmlBytes,
-                    signal: input.signal,
-                    allowPrivateHosts
-                })
-            } catch (error) {
-                input.logger.warn('link preview html fetch failed', {
-                    url: input.url.toString(),
-                    message: toError(error).message
-                })
-                return minimal
+            let html: string | undefined
+            for (let attempt = 1; attempt <= HTML_FETCH_MAX_ATTEMPTS; attempt += 1) {
+                try {
+                    html = await fetchHtml(input.url, {
+                        mediaTransfer,
+                        agent,
+                        userAgent,
+                        timeoutMs: fetchTimeoutMs,
+                        maxBytes: maxHtmlBytes,
+                        signal: input.signal,
+                        allowPrivateHosts
+                    })
+                    break
+                } catch (error) {
+                    const isLastAttempt =
+                        attempt === HTML_FETCH_MAX_ATTEMPTS || input.signal?.aborted === true
+                    if (isLastAttempt) {
+                        input.logger.warn('link preview html fetch failed', {
+                            url: input.url.toString(),
+                            attempt,
+                            maxAttempts: HTML_FETCH_MAX_ATTEMPTS,
+                            message: toError(error).message
+                        })
+                        return minimal
+                    }
+                    const delayMs =
+                        HTML_FETCH_BASE_DELAY_MS * 2 ** (attempt - 1) * (0.5 + Math.random())
+                    input.logger.warn('retrying failed link preview html fetch', {
+                        url: input.url.toString(),
+                        attempt,
+                        maxAttempts: HTML_FETCH_MAX_ATTEMPTS,
+                        delayMs: Math.round(delayMs),
+                        message: toError(error).message
+                    })
+                    await delay(delayMs)
+                }
             }
-            if (html.length === 0) return minimal
+            if (html === undefined || html.length === 0) return minimal
             const parsed = parseHtmlMeta(html, input.url)
             let thumbnail: WaLinkPreviewThumbnailInput | undefined
             if (parsed.imageUrl !== undefined) {
